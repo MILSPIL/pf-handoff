@@ -10,11 +10,18 @@ PF_EFFECTIVE_HOME="${HOME:-${TMPDIR:-/tmp}}"
 SETTINGS_PATH="${CLAUDE_SETTINGS_PATH:-$PF_EFFECTIVE_HOME/.claude/settings.json}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 STATE_DIR="$PF_EFFECTIVE_HOME/.claude/context-state"
+# The harness compacts ~33k tokens BELOW autoCompactWindow: its reply reserve
+# (20k output cap + 13k), read off the Claude Code 2.1.280 binary. Same
+# constant as in context-guard.sh.
+COMPACT_RESERVE=33000
 
 FAIL=0
 
 ok()   { printf 'OK   %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; FAIL=1; }
+# WARN: the install works, but a setting makes part of it useless (a
+# threshold that can never fire). Never sets FAIL: rc stays 0.
+warn() { printf 'WARN %s\n' "$1"; }
 
 # 1) all seven scripts exist and are executable (autocheckpoint.sh is not a
 # registered hook: precompact.sh calls it and blocks compaction when it cannot
@@ -140,9 +147,134 @@ elif [ "$JSON_READER" = "jq" ]; then
   acw=$(jq -r '.autoCompactWindow // ""' "$SETTINGS_PATH" 2>/dev/null)
 fi
 if [ -n "$acw" ]; then
-  ok "autoCompactWindow = $acw tokens (compaction starts there; 800000 = 80% of a 1M window)"
+  case "$acw" in
+    *[!0-9]*) ok "autoCompactWindow = $acw (not a plain number: the harness ignores it)" ;;
+    *) ok "autoCompactWindow = $acw tokens (compaction fires ~${COMPACT_RESERVE} below it, at ~$(( acw - COMPACT_RESERVE )): the harness keeps that much for its reply)" ;;
+  esac
 else
-  ok "autoCompactWindow unset — compaction at the model's limit (that is the harness default)"
+  ok "autoCompactWindow unset: compaction at the model's limit (that is the harness default)"
+fi
+
+# 8) context budgets (v1.11.0). The thresholds that apply in $PWD come from
+# the project file (.agents/context-budget.json), else the global one
+# (~/.config/pf-handoff/context-budget.json), else the 60/80/90% defaults.
+# A threshold at or above the compaction point (autoCompactWindow minus the
+# reply reserve) can never fire: with a 400k autoCompactWindow the 60/80/90%
+# defaults of a 1M window sat above it for a month and the hooks stayed
+# silent. WARN, never FAIL: the hooks still run, they just cannot warn.
+BUDGET_GLOBAL="${PF_CONTEXT_BUDGET_CONFIG:-$PF_EFFECTIVE_HOME/.config/pf-handoff/context-budget.json}"
+BUDGET_PROJECT="$PWD/.agents/context-budget.json"
+
+# Model window: the same rule context-guard.sh uses for its fallback.
+model_name=""
+if [ "$JSON_READER" = "python3" ]; then
+  model_name=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except Exception:
+    d = {}
+print((d.get("model") or "") if isinstance(d, dict) else "")
+' "$SETTINGS_PATH" 2>/dev/null)
+elif [ "$JSON_READER" = "jq" ]; then
+  model_name=$(jq -r '.model // ""' "$SETTINGS_PATH" 2>/dev/null)
+fi
+case "$(printf '%s' "$model_name" | tr '[:upper:]' '[:lower:]')" in
+  *'[1m]'*|*fable*|*opus-5*|*sonnet-5*) win=1000000 ;;
+  *) win=200000 ;;
+esac
+# The env var wins over settings.json, exactly as in the harness.
+acw_eff="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$acw}"
+case "$acw_eff" in ''|*[!0-9]*) acw_eff="" ;; esac
+[ -n "$acw_eff" ] && [ "${#acw_eff}" -gt 9 ] && acw_eff=""
+compact_at=""
+if [ -n "$acw_eff" ]; then
+  cap="$acw_eff"; [ "$win" -lt "$cap" ] && cap="$win"
+  compact_at=$(( cap - COMPACT_RESERVE ))
+fi
+
+# Same validation as budget_ok / budget_parse in the hooks (kept in sync by
+# tests/token-budget.sh): three digit-only values, ascending, within [lo, hi].
+budget_ok() {
+  local lo="$1" hi="$2" a="$3" b="$4" c="$5"
+  case "$a$b$c" in *[!0-9]*|'') return 1 ;; esac
+  { [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ]; } || return 1
+  { [ "${#a}" -le 9 ] && [ "${#b}" -le 9 ] && [ "${#c}" -le 9 ]; } || return 1
+  [ "$a" -ge "$lo" ] 2>/dev/null && [ "$a" -lt "$b" ] 2>/dev/null \
+    && [ "$b" -lt "$c" ] 2>/dev/null && [ "$c" -le "$hi" ] 2>/dev/null
+}
+budget_read() {
+  local f="$1" raw="" tok="" pct="" a="" b="" c=""
+  if [ "$JSON_READER" = "python3" ]; then
+    raw=$(python3 -c '
+import json, sys
+def p(d, k):
+    t = d.get(k) if isinstance(d, dict) else None
+    return "\t".join(str(x) for x in t) if isinstance(t, list) and len(t) == 3 else ""
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+    print(p(d, "thresholds_tokens") + "\x1f" + p(d, "thresholds"))
+except Exception:
+    print("")
+' "$f" 2>/dev/null)
+  elif [ "$JSON_READER" = "jq" ]; then
+    raw=$(jq -r 'def p(k): if (.[k]|type) == "array" and (.[k]|length) == 3 then (.[k]|map(tostring)|join("\t")) else "" end; p("thresholds_tokens") + "\u001f" + p("thresholds")' "$f" 2>/dev/null)
+  fi
+  [ -n "$raw" ] || return 0
+  IFS=$'\x1f' read -r tok pct <<< "$raw"
+  IFS=$'\t' read -r a b c <<< "$tok"
+  if budget_ok 1000 999999999 "$a" "$b" "$c"; then
+    printf 'tok\t%s\t%s\t%s\n' "$(( 10#$a ))" "$(( 10#$b ))" "$(( 10#$c ))"; return 0
+  fi
+  IFS=$'\t' read -r a b c <<< "$pct"
+  if budget_ok 1 99 "$a" "$b" "$c"; then
+    printf 'pct\t%s\t%s\t%s\n' "$(( 10#$a ))" "$(( 10#$b ))" "$(( 10#$c ))"
+  fi
+  return 0
+}
+# budget_judge label source mode a b c: one OK or WARN line for a threshold triple.
+budget_judge() {
+  local label="$1" src="$2" mode="$3" a="$4" b="$5" c="$6" v t unit="%"
+  [ "$mode" = tok ] && unit=" tokens"
+  if [ -z "$compact_at" ]; then
+    if [ "$mode" = tok ]; then
+      warn "$label thresholds_tokens [$a, $b, $c] with autoCompactWindow unset: compaction then happens at the model's limit, so whether they fire in time cannot be told ($src)"
+    else
+      ok "$label thresholds [$a, $b, $c]% ($src)"
+    fi
+    return 0
+  fi
+  for v in "$a" "$b" "$c"; do
+    t="$v"; [ "$mode" = pct ] && t=$(( v * win / 100 ))
+    if [ "$t" -ge "$compact_at" ]; then
+      warn "$label threshold $v$unit (~$t tokens) is at or above the compaction point ~$compact_at (autoCompactWindow $acw_eff minus the ${COMPACT_RESERVE} reply reserve): it can never fire; lower it or raise autoCompactWindow ($src)"
+      return 0
+    fi
+  done
+  ok "$label thresholds [$a, $b, $c]$unit all fire before compaction (~$compact_at) ($src)"
+}
+budget_applied=0
+for pair in "project|$BUDGET_PROJECT" "global|$BUDGET_GLOBAL"; do
+  label="${pair%%|*}"; f="${pair#*|}"
+  if [ ! -e "$f" ]; then
+    ok "$label context-budget absent ($f)"
+    continue
+  fi
+  if [ "$JSON_READER" = "none" ]; then
+    warn "$label context-budget exists but cannot be checked: neither python3 nor jq is available ($f)"
+    continue
+  fi
+  row=$(budget_read "$f")
+  if [ -z "$row" ]; then
+    warn "$label context-budget exists but holds no valid thresholds: the hooks ignore it and the next source applies ($f)"
+    continue
+  fi
+  IFS=$'\t' read -r mode a b c <<< "$row"
+  budget_judge "$label" "$f" "$mode" "$a" "$b" "$c"
+  budget_applied=1
+done
+if [ "$budget_applied" = 0 ] && [ -n "$compact_at" ]; then
+  budget_judge "default" "no context-budget file, 60/80/90% of a ${win} window" pct 60 80 90
 fi
 
 exit "$FAIL"
