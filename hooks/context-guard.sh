@@ -165,12 +165,32 @@ print("\t".join([str(g(d.get("pct"))), str(g(d.get("window"))), str(g(d.get("inp
     local in_tok=0 cache_creation=0 cache_read=0
     if [ -n "$transcript_path" ] && [ -r "$transcript_path" ]; then
       local usage_line
-      usage_line=$(tail -c 200000 -- "$transcript_path" 2>/dev/null | grep '"cache_read_input_tokens"' | tail -1)
+      # Строки API-ошибок ("model":"<synthetic>") несут нулевой usage: попав
+      # последними, они обнуляли оценку и сбрасывали announced: пропускаем.
+      usage_line=$(tail -c 200000 -- "$transcript_path" 2>/dev/null | grep '"cache_read_input_tokens"' | grep -v '"model":"<synthetic>"' | tail -1)
       if [ -n "$usage_line" ]; then
-        local m
-        m=$(printf '%s' "$usage_line" | grep -oE '"input_tokens":[0-9]+' | head -1); in_tok=${m#*:}
-        m=$(printf '%s' "$usage_line" | grep -oE '"cache_creation_input_tokens":[0-9]+' | head -1); cache_creation=${m#*:}
-        m=$(printf '%s' "$usage_line" | grep -oE '"cache_read_input_tokens":[0-9]+' | head -1); cache_read=${m#*:}
+        local m picked="" p_in="" p_cc="" p_cr=""
+        # После вызова радника (advisor) верхнеуровневый usage: СУММА по
+        # итерациям, и cache_read исполнителя входит в неё дважды: контекст
+        # выглядел вдвое больше реального. Есть массив iterations: берём
+        # последнюю итерацию самого исполнителя (usage_pick ниже); нет jq и
+        # python3 или мусор: старые grep по верхнему уровню.
+        case "$usage_line" in
+          *'"iterations":['*)
+            picked=$(printf '%s\n' "$usage_line" | usage_pick "$has_jq")
+            IFS=$'\t' read -r p_in p_cc p_cr <<< "$picked"
+            case "$p_in$p_cc$p_cr" in
+              *[!0-9]*|'') picked="" ;;
+              *) { [ -n "$p_in" ] && [ -n "$p_cc" ] && [ -n "$p_cr" ]; } || picked="" ;;
+            esac ;;
+        esac
+        if [ -n "$picked" ]; then
+          in_tok=$(( 10#$p_in )); cache_creation=$(( 10#$p_cc )); cache_read=$(( 10#$p_cr ))
+        else
+          m=$(printf '%s' "$usage_line" | grep -oE '"input_tokens":[0-9]+' | head -1); in_tok=${m#*:}
+          m=$(printf '%s' "$usage_line" | grep -oE '"cache_creation_input_tokens":[0-9]+' | head -1); cache_creation=${m#*:}
+          m=$(printf '%s' "$usage_line" | grep -oE '"cache_read_input_tokens":[0-9]+' | head -1); cache_read=${m#*:}
+        fi
       fi
     fi
     [ -z "$in_tok" ] && in_tok=0
@@ -311,6 +331,68 @@ print(json.dumps({"pct": int(p), "window": int(w), "input_tokens": int(t), "upda
     mv -f "$tmp" "$state_file"
   else
     rm -f "$tmp" 2>/dev/null
+  fi
+}
+
+# usage_pick has_jq: читает одну строку транскрипта со stdin и печатает
+# "input<TAB>cache_creation<TAB>cache_read" из ПОСЛЕДНЕЙ итерации типа
+# message / fallback_message в usage.iterations, пропуская advisor_message и
+# compaction (это чужие запросы: радник и сжатие). Итерации нет или она
+# невалидна (не объект, не тот тип, поле не число, нулевая): печатает
+# верхнеуровневые числа; строка не разбирается: ничего. Обе ветки (jq и
+# python3) обязаны давать одинаковый результат на одном входе.
+usage_pick() {
+  local has_jq="$1"
+  if [ "$has_jq" = 1 ]; then
+    jq -r '
+      def n: type == "number" and . >= 0;
+      def sum3: (.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0);
+      .message.usage as $u
+      | if ($u|type) != "object" then empty else
+          ([ ($u.iterations // [])[]?
+             | select((if type == "object" then .type else null end) as $t
+                      | $t != "advisor_message" and $t != "compaction") ] | last) as $r
+          | if ($u.iterations|type) == "array" and ($r|type) == "object"
+               and ($r.type == "message" or $r.type == "fallback_message")
+               and ($r.input_tokens|n) and ($r.output_tokens|n)
+               and ($r.cache_creation_input_tokens|n) and ($r.cache_read_input_tokens|n)
+               and ($r|sum3) > 0 and ($u|sum3) > 0
+            then [$r.input_tokens, $r.cache_creation_input_tokens, $r.cache_read_input_tokens]
+            else [($u.input_tokens // 0), ($u.cache_creation_input_tokens // 0), ($u.cache_read_input_tokens // 0)]
+            end
+          | map(tostring) | join("\t")
+        end' 2>/dev/null
+  else
+    python3 -c '
+import json, sys
+K = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+def num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+def sum3(d):
+    return sum((d.get(k) or 0) for k in K)
+try:
+    u = json.loads(sys.stdin.readline())["message"]["usage"]
+    if not isinstance(u, dict):
+        raise SystemExit(0)
+    it = u.get("iterations")
+    r = None
+    if isinstance(it, list):
+        for x in reversed(it):
+            if isinstance(x, dict) and x.get("type") in ("advisor_message", "compaction"):
+                continue
+            r = x
+            break
+    if (isinstance(it, list) and isinstance(r, dict)
+            and r.get("type") in ("message", "fallback_message")
+            and all(num(r.get(k)) for k in K + ("output_tokens",))
+            and sum3(r) > 0 and sum3(u) > 0):
+        vals = [r[k] for k in K]
+    else:
+        vals = [(u.get(k) or 0) for k in K]
+    print("\t".join(str(v) for v in vals))
+except Exception:
+    pass
+' 2>/dev/null
   fi
 }
 
