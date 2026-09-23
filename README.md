@@ -69,7 +69,19 @@ Per-project thresholds — `<project>/.agents/context-budget.json`:
 {"thresholds": [50, 70, 85]}
 ```
 
-Exactly three integers in ascending order (1–99). Zone meanings stay the same: zone 1 — checkpoint, delegate big chunks; zone 2 — no new medium/large chunks; zone 3 — full handoff immediately. Missing or invalid file → defaults 60/80/90. The status-bar colour follows the same project thresholds.
+Exactly three integers in ascending order (1–99), compared against the window percentage. Zone meanings stay the same: zone 1: checkpoint, delegate big chunks; zone 2: no new medium/large chunks; zone 3: full handoff immediately.
+
+Since v1.11.0, thresholds can also be set in **absolute tokens**, compared against tokens used instead of the window percentage:
+
+```json
+{"thresholds_tokens": [400000, 500000, 530000]}
+```
+
+Three integers, 1000–999999999, strictly ascending; if a file has both keys, `thresholds_tokens` wins when valid. There is also a **global** file, `~/.config/pf-handoff/context-budget.json` (same format; env `PF_CONTEXT_BUDGET_CONFIG` overrides the path, used by tests). Precedence: project file, then global file, then the 60/80/90% defaults; an invalid file (wrong key, wrong count, not ascending) is treated as absent and falls through to the next source instead of jumping straight to the defaults. The status-bar colour follows the same project-then-global thresholds; in token mode it compares tokens directly instead of the rounded percentage.
+
+Why tokens: the harness compacts at `autoCompactWindow` tokens, not at a fixed percentage of the window, roughly 33k below that value (its own reply reserve). Percent thresholds of a 1M window can sit above a smaller `autoCompactWindow` and never fire: 60% of 1M is 600k, above a 400k `autoCompactWindow`. Keep every threshold below `autoCompactWindow` minus ~33k; `bash hooks/doctor.sh` prints a `WARN` line (not a failure, exit code stays 0) for a threshold that can never fire, for token thresholds with `autoCompactWindow` unset, and for an invalid budget file. Token thresholds are absolute, so a 200k-window model or a subagent's own window never reaches 400k; use percent thresholds there instead.
+
+Claude Code CLI older than 2.1.275: the statusline's token count is doubled after an advisor-tool call (the CLI aggregates two iterations into one), so upgrade the CLI if the bar looks wrong after using it.
 
 Status bar look & widgets — `~/.config/pf-handoff/statusline.json` (optional; without it the default look is used):
 
