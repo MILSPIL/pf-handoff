@@ -14,8 +14,7 @@
 #  - doctor.sh check 8 (WARN, never FAIL, for thresholds that can never
 #    fire before compaction).
 #
-# Companion design doc: sessions/2026-09-23-pf-handoff-token-thresholds-design.md
-# (section 5 has the case list this file implements, labelled A-J).
+# Cases are labelled A-J; each group header says what it pins down.
 #
 # Bash 3.2 compatible (macOS system bash floor, same constraint as every
 # other script in this family): no associative arrays, no ${var,,}, no
