@@ -732,6 +732,34 @@ for variant in jq py; do
   else
     fail "H($variant) H3 all thresholds clear compact_at" "rc=$rc out=$out"
   fi
+
+  # H4: settings acw=50000 (below the documented minimum 100000; the guard's
+  # acw_read drops such a value) -> doctor must NOT derive a
+  # 17000 compaction point from it: no "compaction point ~17000" WARN, the
+  # tokens file gets the "unset or outside the documented range" WARN instead,
+  # rc=0, no FAIL.
+  home=$(mktempdir); cwd=$(mktempdir)
+  settings="$home/settings.json"; write_doctor_settings "$settings" 50000
+  budget="$home/budget.json"; write_json "$budget" "$GLOBAL_TOK"
+  out=$(cd "$cwd" && env -u CLAUDE_CODE_AUTO_COMPACT_WINDOW HOME="$home" CLAUDE_SETTINGS_PATH="$settings" PF_CONTEXT_BUDGET_CONFIG="$budget" PATH="$mp" "$mp/bash" "$DOCTOR" 2>&1); rc=$?
+  if [ "$rc" = 0 ] && ! printf '%s\n' "$out" | grep -q 'compaction point ~17000' && printf '%s\n' "$out" | grep -q '^WARN.*outside the documented range' && ! printf '%s\n' "$out" | grep -q '^FAIL'; then
+    pass "H($variant) settings acw=50000 (below minimum) -> no 17000 compaction point, range WARN, rc=0"
+  else
+    fail "H($variant) H4 acw below the documented minimum" "rc=$rc out=$out"
+  fi
+
+  # H5: env CLAUDE_CODE_AUTO_COMPACT_WINDOW=0600000 (leading zero; invalid as
+  # a JSON number, so it can only arrive via the env) must read as 600000,
+  # not as an octal literal: compact_at=567000, all three thresholds clear it.
+  home=$(mktempdir); cwd=$(mktempdir)
+  settings="$home/settings.json"; write_doctor_settings "$settings"
+  budget="$home/budget.json"; write_json "$budget" "$GLOBAL_TOK"
+  out=$(cd "$cwd" && env HOME="$home" CLAUDE_SETTINGS_PATH="$settings" PF_CONTEXT_BUDGET_CONFIG="$budget" CLAUDE_CODE_AUTO_COMPACT_WINDOW=0600000 PATH="$mp" "$mp/bash" "$DOCTOR" 2>&1); rc=$?
+  if [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -q 'all fire before compaction (~567000)' && ! printf '%s\n' "$out" | grep -q '^WARN' && ! printf '%s\n' "$out" | grep -q '^FAIL'; then
+    pass "H($variant) env acw=0600000 (leading zero) -> read as 600000, compact_at 567000, no WARN"
+  else
+    fail "H($variant) H5 leading-zero acw" "rc=$rc out=$out"
+  fi
 done
 
 # ===========================================================================

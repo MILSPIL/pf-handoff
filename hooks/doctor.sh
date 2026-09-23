@@ -149,7 +149,16 @@ fi
 if [ -n "$acw" ]; then
   case "$acw" in
     *[!0-9]*) ok "autoCompactWindow = $acw (not a plain number: the harness ignores it)" ;;
-    *) ok "autoCompactWindow = $acw tokens (compaction fires ~${COMPACT_RESERVE} below it, at ~$(( acw - COMPACT_RESERVE )): the harness keeps that much for its reply)" ;;
+    *) # Same floor and base-10 normalisation as acw_read in context-guard.sh:
+       # outside the documented range (100000..1000000 tokens; the harness
+       # clamps the env var to the minimum, settings.json is undocumented)
+       # the guard does not apply the value, and a leading zero must not
+       # reach bash arithmetic as an octal literal.
+       if [ "${#acw}" -gt 9 ] || [ "$acw" -lt 100000 ] 2>/dev/null; then
+         ok "autoCompactWindow = $acw (outside the documented range 100000..1000000: the guard does not apply it, so the compaction point is unknown; the harness clamps an env value to 100000)"
+       else
+         ok "autoCompactWindow = $(( 10#$acw )) tokens (compaction fires ~${COMPACT_RESERVE} below it, at ~$(( 10#$acw - COMPACT_RESERVE )): the harness keeps that much for its reply)"
+       fi ;;
   esac
 else
   ok "autoCompactWindow unset: compaction at the model's limit (that is the harness default)"
@@ -187,6 +196,13 @@ esac
 acw_eff="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$acw}"
 case "$acw_eff" in ''|*[!0-9]*) acw_eff="" ;; esac
 [ -n "$acw_eff" ] && [ "${#acw_eff}" -gt 9 ] && acw_eff=""
+# Same floor and base-10 normalisation as acw_read in context-guard.sh: below
+# the documented minimum 100000 the guard does not apply the value, so no
+# compaction point may be derived from it here either (a 50000 used to yield
+# a 17000 point and a WARN for every threshold), and a leading zero must not
+# reach bash arithmetic as an octal literal.
+[ -n "$acw_eff" ] && { [ "$acw_eff" -ge 100000 ] 2>/dev/null || acw_eff=""; }
+[ -n "$acw_eff" ] && acw_eff=$(( 10#$acw_eff ))
 compact_at=""
 if [ -n "$acw_eff" ]; then
   cap="$acw_eff"; [ "$win" -lt "$cap" ] && cap="$win"
@@ -238,7 +254,7 @@ budget_judge() {
   [ "$mode" = tok ] && unit=" tokens"
   if [ -z "$compact_at" ]; then
     if [ "$mode" = tok ]; then
-      warn "$label thresholds_tokens [$a, $b, $c] with autoCompactWindow unset: compaction then happens at the model's limit, so whether they fire in time cannot be told ($src)"
+      warn "$label thresholds_tokens [$a, $b, $c] with autoCompactWindow unset or outside the documented range: compaction then happens at the model's limit, so whether they fire in time cannot be told ($src)"
     else
       ok "$label thresholds [$a, $b, $c]% ($src)"
     fi
