@@ -91,7 +91,7 @@ echo "bash:       $BASH_BIN ($("$BASH_BIN" --version | head -1))"
 # its +N/-N counters green/red, which would confound the zone read.
 sl_zone() {
   local proj="$1" out ctxline
-  out=$(cd "$proj" && PF_STATUSLINE_CONFIG=/nonexistent-thr-parity-cfg.json "$BASH_BIN" "$STATUSLINE" --preview 2>/dev/null)
+  out=$(cd "$proj" && PF_CONTEXT_BUDGET_CONFIG=/nonexistent-thr-parity-budget.json PF_STATUSLINE_CONFIG=/nonexistent-thr-parity-cfg.json "$BASH_BIN" "$STATUSLINE" --preview 2>/dev/null)
   ctxline=$(printf '%s\n' "$out" | grep 'Context:')
   case "$ctxline" in
     *$'\033[31m'*) echo red ;;
@@ -117,7 +117,7 @@ guard_zone() {
   printf '{"pct": %s, "window": 200000, "input_tokens": 82000, "updated": %s, "announced": 0}' \
     "$pct" "$now" > "$home/.claude/context-state/$sid.json"
   out=$(printf '{"session_id":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"/nonexistent.jsonl","cwd":"%s"}' "$sid" "$proj" \
-    | HOME="$home" CLAUDE_SETTINGS_PATH=/nonexistent-thr-parity-settings.json "$BASH_BIN" "$GUARD" 2>/dev/null)
+    | HOME="$home" PF_CONTEXT_BUDGET_CONFIG=/nonexistent-thr-parity-budget.json CLAUDE_SETTINGS_PATH=/nonexistent-thr-parity-settings.json "$BASH_BIN" "$GUARD" 2>/dev/null)
   if printf '%s' "$out" | grep -q 'немедленно полный'; then echo red
   elif printf '%s' "$out" | grep -q 'M/L-кусков'; then echo red
   elif printf '%s' "$out" | grep -q 'чекпоинт HANDOFF'; then echo yellow
@@ -232,7 +232,7 @@ guard_at() {
   printf '{"pct": %s, "window": 1000000, "input_tokens": 800000, "updated": %s, "announced": 0}' \
     "$pct" "$now" > "$home/.claude/context-state/$sid.json"
   printf '{"session_id":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"/nonexistent.jsonl","cwd":"%s"}' "$sid" "$proj" \
-    | HOME="$home" CLAUDE_SETTINGS_PATH=/nonexistent-thr-parity-settings.json "$BASH_BIN" "$GUARD" 2>/dev/null
+    | HOME="$home" PF_CONTEXT_BUDGET_CONFIG=/nonexistent-thr-parity-budget.json CLAUDE_SETTINGS_PATH=/nonexistent-thr-parity-settings.json "$BASH_BIN" "$GUARD" 2>/dev/null
 }
 
 if [ ! -f "$AUTOCKPT" ]; then

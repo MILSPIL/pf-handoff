@@ -20,6 +20,12 @@ THRESH_Z3='[Контекст: занято %s%%. §13: немедленно по
 # сообщения — чтобы сжатие не застало состояние несохранённым.
 THRESH_Z2_OK=' Авто-снимок состояния записан сам: %s. Смысловой чекпоинт всё равно за тобой: сделай pf-handoff — снимок собран скриптом и не отличает доказанное от заявленного.'
 THRESH_Z2_FAIL=' ВНИМАНИЕ: авто-снимок состояния записать НЕ УДАЛОСЬ. Сжимать контекст нельзя (/compact и /clear запрещены), пока состояние не сохранено руками через pf-handoff: сжатие с потерей состояния хуже, чем его отсутствие (I-036). PreCompact заблокирует автосжатие до починки записи.'
+# Хвост «до автосжатия» (v1.11.0): харнесс запускает сжатие примерно на 33k
+# токенов НИЖЕ autoCompactWindow (резерв под ответ модели: 20k вывода плюс
+# 13k, снято с бинарника Claude Code 2.1.280). Показываем, сколько осталось до
+# этой точки, чтобы агент не считал «свободно ~600k» за реальный запас.
+COMPACT_RESERVE=33000
+THRESH_ACW=' До автосжатия ~%sk токенов (autoCompactWindow %sk).'
 
 run() {
   local input
@@ -79,44 +85,25 @@ print("\x1f".join([str(d.get("session_id") or ""), str(d.get("hook_event_name") 
     session_id="agent-$agent_id"
   fi
 
-  # Пороги зон: по умолчанию 60/80/90, проект может переопределить файлом
-  # <cwd>/.agents/context-budget.json вида {"thresholds": [50, 70, 85]}
-  # (ровно три целых 1–99 по возрастанию; число или строка из одних цифр —
-  # обе стороны трактуют одинаково; иначе — молча дефолт).
+  # Пороги зон (v1.11.0): по умолчанию 60/80/90% окна. Переопределение: файл
+  # .agents/context-budget.json, сперва проектный (<cwd>), потом глобальный
+  # (~/.config/pf-handoff/, путь для тестов: PF_CONTEXT_BUDGET_CONFIG).
+  # Форматы: {"thresholds_tokens": [400000, 500000, 530000]}, абсолютные токены
+  # (три целых 1000..999999999 по возрастанию), сравнение идёт с занятыми
+  # токенами, а не с процентом; {"thresholds": [50, 70, 85]}, проценты (три
+  # целых 1..99 по возрастанию). Невалидный файл = отсутствующий (падаем к
+  # следующему источнику). Разбор: budget_parse ниже, та же функция в
+  # statusline.sh: бар обязан краснеть там же, где guard шлёт директивы.
   local t1=60 t2=80 t3=90
-  local cfg="$cwd_in/.agents/context-budget.json"
-  if [ -n "$cwd_in" ] && [ -f "$cfg" ] && [ -r "$cfg" ]; then
-    local trow=""
-    if [ "$has_jq" = 1 ]; then
-      trow=$(jq -r 'if (.thresholds|type)=="array" and (.thresholds|length)==3 then (.thresholds|map(tostring)|join("\t")) else "" end' "$cfg" 2>/dev/null)
-    else
-      trow=$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
-    t = d.get("thresholds")
-    assert isinstance(t, list) and len(t) == 3
-    # str(x), НЕ str(int(x)): целочисленность проверяет bash ниже — так ветка
-    # без jq отвергает дробные ровно как ветка с jq (и как statusline.sh).
-    print("\t".join(str(x) for x in t))
-except Exception:
-    print("")
-' "$cfg" 2>/dev/null)
-    fi
-    if [ -n "$trow" ]; then
-      local c1 c2 c3
-      IFS=$'\t' read -r c1 c2 c3 <<< "$trow"
-      # Сначала «только цифры», как в statusline.sh: `test -ge` терпит пробелы и
-      # знак (" 50", "+50"), поэтому без этого фильтра guard принимал конфиги,
-      # которые статус-строка отвергает, и зоны бара расходились с директивами.
-      case "$c1$c2$c3" in
-        *[!0-9]*|'') : ;;
-        *)
-          if [ "$c1" -ge 1 ] 2>/dev/null && [ "$c1" -lt "$c2" ] 2>/dev/null && [ "$c2" -lt "$c3" ] 2>/dev/null && [ "$c3" -le 99 ] 2>/dev/null; then
-            t1="$c1"; t2="$c2"; t3="$c3"
-          fi ;;
-      esac
-    fi
+  local bmode=pct brow="" bfile
+  for bfile in "${cwd_in:+$cwd_in/.agents/context-budget.json}" \
+               "${PF_CONTEXT_BUDGET_CONFIG:-$PF_EFFECTIVE_HOME/.config/pf-handoff/context-budget.json}"; do
+    { [ -n "$bfile" ] && [ -f "$bfile" ] && [ -r "$bfile" ]; } || continue
+    brow=$(budget_parse "$bfile" "$has_jq")
+    [ -n "$brow" ] && break
+  done
+  if [ -n "$brow" ]; then
+    IFS=$'\t' read -r bmode t1 t2 t3 <<< "$brow"
   fi
 
   local state_dir state_file
@@ -240,20 +227,49 @@ print(d.get("model") or "")
 
   [ -z "${pct:-}" ] && return 0
 
+  # Метрика сравнения с порогами: процент окна (режим pct, по умолчанию) или
+  # занятые токены (режим tok, thresholds_tokens). announced хранит значение
+  # пересечённого порога (60 или 400000): в режиме tok оно больше 99, и при
+  # возврате к процентам считается «ничего не объявлено», чтобы порог
+  # объявился заново, а не молчал до конца сессии.
+  local metric="$pct"
+  if [ "$bmode" = tok ]; then
+    case "${used_tokens:-}" in ''|*[!0-9]*) return 0 ;; esac
+    metric="$used_tokens"
+  elif [ "${announced:-0}" -gt 99 ] 2>/dev/null; then
+    announced=0
+  fi
+
   local new_announced=0 zone=0
-  if [ "$pct" -ge "$t3" ] 2>/dev/null; then new_announced=$t3; zone=3
-  elif [ "$pct" -ge "$t2" ] 2>/dev/null; then new_announced=$t2; zone=2
-  elif [ "$pct" -ge "$t1" ] 2>/dev/null; then new_announced=$t1; zone=1
+  if [ "$metric" -ge "$t3" ] 2>/dev/null; then new_announced=$t3; zone=3
+  elif [ "$metric" -ge "$t2" ] 2>/dev/null; then new_announced=$t2; zone=2
+  elif [ "$metric" -ge "$t1" ] 2>/dev/null; then new_announced=$t1; zone=1
   fi
 
   if [ "$new_announced" -gt 0 ] 2>/dev/null && [ "$new_announced" -gt "${announced:-0}" ] 2>/dev/null; then
-    local free_tokens xk msg
+    local free_tokens xk msg acw acw_tail="" cap left reason
     free_tokens=$(( window - used_tokens ))
     [ "$free_tokens" -lt 0 ] && free_tokens=0
     xk=$(( free_tokens / 1000 ))
+    # Хвост «до автосжатия»: запас до точки, где харнесс реально сжимает
+    # (min(autoCompactWindow, окно) минус резерв COMPACT_RESERVE). Нет
+    # autoCompactWindow ни в env, ни в settings.json: хвоста нет, сообщение
+    # байт в байт как в v1.10.0.
+    acw=$(acw_read "$has_jq")
+    if [ -n "$acw" ]; then
+      case "${used_tokens:-}" in
+        ''|*[!0-9]*) : ;;
+        *) cap="$acw"
+           [ "$window" -gt 0 ] 2>/dev/null && [ "$window" -lt "$cap" ] 2>/dev/null && cap="$window"
+           left=$(( cap - COMPACT_RESERVE - used_tokens )); [ "$left" -lt 0 ] && left=0
+           acw_tail=$(printf "$THRESH_ACW" "$(( left / 1000 ))" "$(( acw / 1000 ))") ;;
+      esac
+    fi
+    reason="порог t2 ($pct%)"
+    [ "$bmode" = tok ] && reason="порог t2 (${used_tokens} токенов)"
     case "$zone" in
-      1) msg=$(printf "$THRESH_Z1" "$pct" "$xk") ;;
-      2) msg=$(printf "$THRESH_Z2" "$pct" "$xk")
+      1) msg=$(printf "$THRESH_Z1" "$pct" "$xk")$acw_tail ;;
+      2) msg=$(printf "$THRESH_Z2" "$pct" "$xk")$acw_tail
          # Порог t2 — единственная точка, где чекпоинт выполняется без спроса.
          # Порог берётся из .agents/context-budget.json проекта, если он там
          # переопределён, поэтому снимок следует за настройкой проекта (в
@@ -264,7 +280,7 @@ print(d.get("model") or "")
          if [ -f "$ac" ] && [ -r "$ac" ]; then
            snap=$(bash "$ac" --session "$session_id" --cwd "${cwd_in:-}" \
                     --transcript "${transcript_path:-}" \
-                    --reason "порог t2 ($pct%)" 2>/dev/null)
+                    --reason "$reason" 2>/dev/null)
            ac_rc=$?
          fi
          if [ "$ac_rc" -eq 0 ] && [ -n "$snap" ]; then
@@ -274,11 +290,11 @@ print(d.get("model") or "")
          else
            msg="$msg$THRESH_Z2_FAIL"
          fi ;;
-      3) msg=$(printf "$THRESH_Z3" "$pct") ;;
+      3) msg=$(printf "$THRESH_Z3" "$pct")$acw_tail ;;
     esac
     emit_json "$event" "$msg" "$has_jq"
     write_state "$state_dir" "$state_file" "$has_jq" "$fallback_used" "$new_announced" "$pct" "$window" "$used_tokens" "$s_pct" "$s_window" "$s_tokens" "$s_updated"
-  elif [ "$pct" -lt "$t1" ] 2>/dev/null && [ "${announced:-0}" != 0 ]; then
+  elif [ "$metric" -lt "$t1" ] 2>/dev/null && [ "${announced:-0}" != 0 ]; then
     write_state "$state_dir" "$state_file" "$has_jq" "$fallback_used" 0 "$pct" "$window" "$used_tokens" "$s_pct" "$s_window" "$s_tokens" "$s_updated"
   fi
   return 0
@@ -332,6 +348,85 @@ print(json.dumps({"pct": int(p), "window": int(w), "input_tokens": int(t), "upda
   else
     rm -f "$tmp" 2>/dev/null
   fi
+}
+
+# budget_ok lo hi a b c: три значения из одних цифр (не длиннее 9 знаков) по
+# строгому возрастанию в пределах [lo, hi]. Одна проверка для процентов и токенов.
+budget_ok() {
+  local lo="$1" hi="$2" a="$3" b="$4" c="$5"
+  case "$a$b$c" in *[!0-9]*|'') return 1 ;; esac
+  { [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ]; } || return 1
+  { [ "${#a}" -le 9 ] && [ "${#b}" -le 9 ] && [ "${#c}" -le 9 ]; } || return 1
+  [ "$a" -ge "$lo" ] 2>/dev/null && [ "$a" -lt "$b" ] 2>/dev/null \
+    && [ "$b" -lt "$c" ] 2>/dev/null && [ "$c" -le "$hi" ] 2>/dev/null
+}
+
+# budget_parse file has_jq: печатает "tok<TAB>a<TAB>b<TAB>c" (пороги в токенах,
+# ключ thresholds_tokens, 1000..999999999) или "pct<TAB>a<TAB>b<TAB>c" (проценты,
+# ключ thresholds, 1..99), или ничего, если файл не даёт валидной тройки.
+# При обоих ключах верх берут токены. Ветки jq и python3 обязаны совпадать:
+# дробные, экспоненты (4e5), строки с пробелом или знаком отвергаются одинаково
+# (число и строка из одних цифр трактуются как одно и то же). Копия функции
+# живёт в statusline.sh: бар обязан краснеть там же, где guard шлёт директивы.
+budget_parse() {
+  local f="$1" has_jq="$2" raw="" tok="" pct="" a="" b="" c=""
+  if [ "$has_jq" = 1 ]; then
+    raw=$(jq -r 'def p(k): if (.[k]|type) == "array" and (.[k]|length) == 3 then (.[k]|map(tostring)|join("\t")) else "" end; p("thresholds_tokens") + "\u001f" + p("thresholds")' "$f" 2>/dev/null)
+  else
+    raw=$(python3 -c '
+import json, sys
+def p(d, k):
+    t = d.get(k) if isinstance(d, dict) else None
+    return "\t".join(str(x) for x in t) if isinstance(t, list) and len(t) == 3 else ""
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+    print(p(d, "thresholds_tokens") + "\x1f" + p(d, "thresholds"))
+except Exception:
+    print("")
+' "$f" 2>/dev/null)
+  fi
+  [ -n "$raw" ] || return 0
+  IFS=$'\x1f' read -r tok pct <<< "$raw"
+  IFS=$'\t' read -r a b c <<< "$tok"
+  if budget_ok 1000 999999999 "$a" "$b" "$c"; then
+    printf 'tok\t%s\t%s\t%s\n' "$(( 10#$a ))" "$(( 10#$b ))" "$(( 10#$c ))"; return 0
+  fi
+  IFS=$'\t' read -r a b c <<< "$pct"
+  if budget_ok 1 99 "$a" "$b" "$c"; then
+    printf 'pct\t%s\t%s\t%s\n' "$(( 10#$a ))" "$(( 10#$b ))" "$(( 10#$c ))"
+  fi
+  return 0
+}
+
+# acw_read has_jq: порог автосжатия харнесса. Сперва env
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW (харнесс читает его первым), иначе
+# autoCompactWindow из settings.json (путь: CLAUDE_SETTINGS_PATH или
+# ~/.claude/settings.json). Только цифры, не короче 100000 (минимум харнесса)
+# и не длиннее 9 знаков; иначе пусто, и хвоста «до автосжатия» не будет.
+acw_read() {
+  local has_jq="$1" v="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" sp
+  if [ -z "$v" ]; then
+    sp="${CLAUDE_SETTINGS_PATH:-$PF_EFFECTIVE_HOME/.claude/settings.json}"
+    if [ -r "$sp" ]; then
+      if [ "$has_jq" = 1 ]; then
+        v=$(jq -r '.autoCompactWindow // "" | tostring' "$sp" 2>/dev/null)
+      else
+        v=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+    v = d.get("autoCompactWindow") if isinstance(d, dict) else None
+    print("" if v is None else str(v))
+except Exception:
+    print("")
+' "$sp" 2>/dev/null)
+      fi
+    fi
+  fi
+  case "$v" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${#v}" -le 9 ] || return 0
+  [ "$v" -ge 100000 ] 2>/dev/null || return 0
+  printf '%s\n' "$(( 10#$v ))"
 }
 
 # usage_pick has_jq: читает одну строку транскрипта со stdin и печатает

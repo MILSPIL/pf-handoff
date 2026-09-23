@@ -33,6 +33,54 @@ fmt_reset() {
   else printf '%dm' "$m"; fi
 }
 
+# budget_ok lo hi a b c: три значения из одних цифр (не длиннее 9 знаков) по
+# строгому возрастанию в пределах [lo, hi]. Одна проверка для процентов и токенов.
+budget_ok() {
+  local lo="$1" hi="$2" a="$3" b="$4" c="$5"
+  case "$a$b$c" in *[!0-9]*|'') return 1 ;; esac
+  { [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ]; } || return 1
+  { [ "${#a}" -le 9 ] && [ "${#b}" -le 9 ] && [ "${#c}" -le 9 ]; } || return 1
+  [ "$a" -ge "$lo" ] 2>/dev/null && [ "$a" -lt "$b" ] 2>/dev/null \
+    && [ "$b" -lt "$c" ] 2>/dev/null && [ "$c" -le "$hi" ] 2>/dev/null
+}
+
+# budget_parse file has_jq: печатает "tok<TAB>a<TAB>b<TAB>c" (пороги в токенах,
+# ключ thresholds_tokens, 1000..999999999) или "pct<TAB>a<TAB>b<TAB>c" (проценты,
+# ключ thresholds, 1..99), или ничего, если файл не даёт валидной тройки.
+# При обоих ключах верх берут токены. Ветки jq и python3 обязаны совпадать:
+# дробные, экспоненты (4e5), строки с пробелом или знаком отвергаются одинаково
+# (число и строка из одних цифр трактуются как одно и то же). Копия функции
+# живёт в context-guard.sh: бар обязан краснеть там же, где guard шлёт директивы.
+budget_parse() {
+  local f="$1" has_jq="$2" raw="" tok="" pct="" a="" b="" c=""
+  if [ "$has_jq" = 1 ]; then
+    raw=$(jq -r 'def p(k): if (.[k]|type) == "array" and (.[k]|length) == 3 then (.[k]|map(tostring)|join("\t")) else "" end; p("thresholds_tokens") + "\u001f" + p("thresholds")' "$f" 2>/dev/null)
+  else
+    raw=$(python3 -c '
+import json, sys
+def p(d, k):
+    t = d.get(k) if isinstance(d, dict) else None
+    return "\t".join(str(x) for x in t) if isinstance(t, list) and len(t) == 3 else ""
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+    print(p(d, "thresholds_tokens") + "\x1f" + p(d, "thresholds"))
+except Exception:
+    print("")
+' "$f" 2>/dev/null)
+  fi
+  [ -n "$raw" ] || return 0
+  IFS=$'\x1f' read -r tok pct <<< "$raw"
+  IFS=$'\t' read -r a b c <<< "$tok"
+  if budget_ok 1000 999999999 "$a" "$b" "$c"; then
+    printf 'tok\t%s\t%s\t%s\n' "$(( 10#$a ))" "$(( 10#$b ))" "$(( 10#$c ))"; return 0
+  fi
+  IFS=$'\t' read -r a b c <<< "$pct"
+  if budget_ok 1 99 "$a" "$b" "$c"; then
+    printf 'pct\t%s\t%s\t%s\n' "$(( 10#$a ))" "$(( 10#$b ))" "$(( 10#$c ))"
+  fi
+  return 0
+}
+
 run() {
   local input
   input=$(cat)
@@ -183,45 +231,30 @@ print("\x1f".join(re.sub(r"[\x00-\x1f\x7f]", " ", x) for x in row))' "$cfg_file"
       200000)  win_label="200k" ;;
       *) win_label=$(awk -v w="$window_raw" 'BEGIN{ if (w>=1000000) printf "%.1fM", w/1000000; else printf "%dk", int(w/1000) }') ;;
     esac
-    # Границы цветовых зон — из порогов ПРОЕКТА (.agents/context-budget.json в cwd),
-    # чтобы бар краснел там же, где guard шлёт директивы; нет конфига — 60/80.
+    # Границы цветовых зон: те же источники и тот же разбор (budget_parse), что
+    # у context-guard.sh: сперва проектный .agents/context-budget.json в cwd,
+    # потом глобальный ~/.config/pf-handoff/context-budget.json (путь для
+    # тестов: PF_CONTEXT_BUDGET_CONFIG); бар обязан краснеть там же, где guard
+    # шлёт директивы. Нет конфига: 60/80. Пороги в токенах (thresholds_tokens)
+    # сравниваются с токенами напрямую, а не с округлённым процентом, иначе на
+    # границе зона бара и зона guard расходились бы на 1%. Заливка бара при
+    # этом остаётся процентной.
     local z1=60 z2=80 zrow=""
-    if [ -n "${cwd_in:-}" ] && [ -f "$cwd_in/.agents/context-budget.json" ] && [ -r "$cwd_in/.agents/context-budget.json" ]; then
-      if [ "$has_jq" = 1 ]; then
-        zrow=$(jq -r 'if (.thresholds|type)=="array" and (.thresholds|length)==3 then (.thresholds|map(tostring)|join("\t")) else "" end' "$cwd_in/.agents/context-budget.json" 2>/dev/null)
-      else
-        zrow=$(python3 -c '
-import json, sys
-try:
-    tt = json.load(open(sys.argv[1], encoding="utf-8-sig")).get("thresholds")
-    assert isinstance(tt, list) and len(tt) == 3
-    print("\t".join(str(x) for x in tt))
-except Exception:
-    print("")' "$cwd_in/.agents/context-budget.json" 2>/dev/null)
-      fi
-      # Валидация ровно та же, что в context-guard.sh (три целых 1–99 по
-      # возрастанию; дробные и любой мусор — молча дефолт). Иначе бар красился
-      # бы по одним границам, а guard слал директивы по другим. Разделитель —
-      # табуляция, а не пробел: значение вида "60 70" внутри JSON иначе
-      # распалось бы на два поля и проехало валидацию.
-      if [ -n "$zrow" ]; then
-        local c1 c2 c3
-        IFS=$'\t' read -r c1 c2 c3 <<< "$zrow"
-        case "$c1$c2$c3" in
-          *[!0-9]*|'') : ;;
-          *)
-            if [ "$c1" -ge 1 ] 2>/dev/null && [ "$c1" -lt "$c2" ] 2>/dev/null \
-               && [ "$c2" -lt "$c3" ] 2>/dev/null && [ "$c3" -le 99 ] 2>/dev/null; then
-              z1="$c1"; z2="$c2"
-            fi
-            ;;
-        esac
-      fi
+    local zmode=pct zmetric="$pct_int" zfile
+    for zfile in "${cwd_in:+$cwd_in/.agents/context-budget.json}" \
+                 "${PF_CONTEXT_BUDGET_CONFIG:-$PF_EFFECTIVE_HOME/.config/pf-handoff/context-budget.json}"; do
+      { [ -n "$zfile" ] && [ -f "$zfile" ] && [ -r "$zfile" ]; } || continue
+      zrow=$(budget_parse "$zfile" "$has_jq")
+      [ -n "$zrow" ] && break
+    done
+    if [ -n "$zrow" ]; then
+      IFS=$'\t' read -r zmode z1 z2 _ <<< "$zrow"
+      [ "$zmode" = tok ] && zmetric="$tokens_int"
     fi
     filled=$(( pct_int * cfg_bw / 100 )); [ "$filled" -gt "$cfg_bw" ] && filled="$cfg_bw"; [ "$filled" -lt 0 ] && filled=0
     bar=$(PF_BF="$cfg_bf" PF_BE="$cfg_be" awk -v f="$filled" -v w="$cfg_bw" 'BEGIN{bf=ENVIRON["PF_BF"]; be=ENVIRON["PF_BE"]; for(i=1;i<=w;i++) printf "%s", (i<=f ? bf : be)}')
-    if [ "$pct_int" -ge "$z2" ]; then zone="$C_RED"
-    elif [ "$pct_int" -ge "$z1" ]; then zone="$C_YLW"
+    if [ "$zmetric" -ge "$z2" ]; then zone="$C_RED"
+    elif [ "$zmetric" -ge "$z1" ]; then zone="$C_YLW"
     else zone="$C_GRN"; fi
   fi
 
