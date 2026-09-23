@@ -157,6 +157,17 @@ else
 fi
 
 # ===========================================================================
+group "token-budget.sh (v1.11.0: token thresholds, global config, advisor-doubling fix)"
+# ===========================================================================
+tb_out=$("$BASH_BIN" "$TESTS_DIR/token-budget.sh" 2>&1); tb_rc=$?
+echo "$tb_out"
+if [ "$tb_rc" = 0 ] && printf '%s' "$tb_out" | grep -q '^RESULT: GREEN$'; then
+  pass "token-budget.sh: RESULT GREEN"
+else
+  fail "token-budget.sh: not green (rc=$tb_rc)"
+fi
+
+# ===========================================================================
 group "claims-check-probes.sh (T-030): write-claim matching, hostile battery"
 # ===========================================================================
 cc_probes="$TESTS_DIR/claims-check-probes.sh"
@@ -638,7 +649,30 @@ if [ "$mut_tp_rc" != 0 ] && printf '%s' "$mut_tp_out" | grep -q '^RESULT: RED$';
   n_fail=$(printf '%s' "$mut_tp_out" | grep -oE '^TOTAL: [0-9]+/[0-9]+')
   pass "mutated copy (statusline z1=40, guard unchanged) -> threshold-parity.sh correctly reports RED ($n_fail)"
 else
-  fail "mutated copy did NOT turn threshold-parity.sh red — negative control is not sensitive" "$mut_tp_out"
+  fail "mutated copy did NOT turn threshold-parity.sh red (negative control is not sensitive)" "$mut_tp_out"
+fi
+
+# ===========================================================================
+group "Negative control 3/3: a broken advisor_message skip MUST turn token-budget.sh red"
+# ===========================================================================
+# token-budget.sh's case E(i) is the one case whose last iterations entry is
+# the advisor_message itself (a trailing advisor call, no message after it):
+# it is the only one of E's variants where breaking the "skip advisor_message"
+# comparison changes which entry usage_pick lands on (the mutated guard
+# selects the advisor entry, fails its type check, and falls back to the
+# doubled top-level aggregate; see the case E comments in token-budget.sh).
+# `/g`, not the first occurrence only: the string appears in both the jq and
+# the python3 branch of usage_pick, and both must break for this control to
+# mean anything.
+mut3="$(mktempdir)"
+cp -R "$ROOT/hooks" "$ROOT/tests" "$mut3/"
+sed -i.bak 's/advisor_message/advisor_messageX/g' "$mut3/hooks/context-guard.sh" && rm -f "$mut3/hooks/context-guard.sh.bak"
+mut_tb_out=$("$BASH_BIN" "$mut3/tests/token-budget.sh" 2>&1); mut_tb_rc=$?
+if [ "$mut_tb_rc" != 0 ] && printf '%s' "$mut_tb_out" | grep -q '^RESULT: RED$'; then
+  n_fail=$(printf '%s' "$mut_tb_out" | grep -oE '^TOTAL: [0-9]+/[0-9]+')
+  pass "mutated copy (advisor_message -> advisor_messageX in context-guard.sh) -> token-budget.sh correctly reports RED ($n_fail)"
+else
+  fail "mutated copy did NOT turn token-budget.sh red (negative control is not sensitive)" "$mut_tb_out"
 fi
 
 # ===========================================================================
