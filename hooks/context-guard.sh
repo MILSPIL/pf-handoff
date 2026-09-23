@@ -323,7 +323,11 @@ write_state() {
   local out_pct out_window out_tokens out_updated tmp
 
   if [ "$fallback_used" = 1 ]; then
-    out_pct="$fresh_pct"; out_window="$fresh_window"; out_tokens="$fresh_used"; out_updated=$(date +%s)
+    # updated=0, а не «сейчас»: оценка по транскрипту это НЕ показание
+    # сенсора (statusline.sh). С меткой «сейчас» следующие 300 с guard верил
+    # бы собственной устаревшей цифре и опаздывал с зонами 2/3 до 5 минут
+    # (в десктопном приложении сенсора нет вовсе, там это был каждый вызов).
+    out_pct="$fresh_pct"; out_window="$fresh_window"; out_tokens="$fresh_used"; out_updated=0
   else
     out_pct="$s_pct"; out_window="$s_window"; out_tokens="$s_tokens"; out_updated="${s_updated:-$(date +%s)}"
   fi
