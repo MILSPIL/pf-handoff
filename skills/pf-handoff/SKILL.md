@@ -17,7 +17,7 @@ The live task state is the project's HANDOFF file `.agents/runtime/handoff/YYYY-
 3. Rewrite the file WHOLE per the template, ≤120 lines: Цель / Состояние / Следующий шаг / Блокеры и вопросы / Ключевые файлы и решения / Не делать. Anything stale from the previous version — one line in «Не делать», or out.
 4. Refresh `updated` in the frontmatter and the statuses of the affected task packets (§9).
 5. Close (session ends, or the human asked): `status: closed`, journal entry §10 (decisions and the handoff, not diffs), then one line to the human on how to continue: same chat — just continue; new chat — `/pf-resume <slug>`; terminal closed — `claude --continue`.
-6. Closing while the session worked outside the main branch — close the branch per `references/branch-closing.md` (merge `--ff-only`, remove the worktree, delete the branch). Anything off (divergence, uncommitted changes, `-d` refuses) — delete nothing, report to the human.
+6. Closing while the session worked outside the main branch: close the branch per `references/branch-closing.md` (merge `--ff-only`, remove the worktree, delete the branch). Anything off (divergence, uncommitted changes, `-d` refuses): delete nothing, report to the human. The session journal reaches main in any case: if the branch cannot be merged, carry over the journal alone (`branch-closing.md`, step 3a). Both change main and need the human's explicit yes in chat (auto mode blocks them otherwise), so ask with one line in the final report; never skip it silently.
 
 ## Forbidden
 

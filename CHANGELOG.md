@@ -4,6 +4,12 @@
 
 Semver: breaking changes (HANDOFF file format, state file names, skill contracts, install scheme) = major; new features = minor; fixes = patch.
 
+## Unreleased
+
+- **The session journal reaches main even when the branch does not.** A session in a git worktree committed its journal to its own branch, and when nobody merged that branch the entry was lost to main, the next sessions and the memory index (24.09.2026: 11 such journals across two projects). `references/branch-closing.md` gains step 3a: when the branch cannot be merged (main moved ahead, the work is unfinished), carry over the journal file(s) alone as a separate commit on main; projects that ship `.agents/bin/journal-scan.sh` (the `_client-template` standard, 1.1+) use its `--apply --push`. Step 6 of the skill says so.
+- **Ask, do not skip.** Merging and carrying over both change main, and auto mode blocks a merge in the primary copy and a push to main without the human's explicit yes in chat. The agent used to skip the step silently; step 6 and step 2 of the reference now say to ask with one line in the final report and wait for the yes.
+- **A branch the app created for the session counts as the session's own.** "You did not create the branch" kept step 6 from ever running in Claude Code's `.claude/worktrees/<name>` and Orca workspaces, where the app, not the agent, creates the branch.
+
 ## v1.11.0 - 2026-09-23
 
 Thresholds in absolute tokens, a global config file, and a fix for context estimates doubled by advisor calls. Minor, not patch: the token-threshold config key and the global file are a genuinely new capability, while the HANDOFF format, the state file names and the install scheme are untouched (this project's own bar for major).

@@ -12,7 +12,9 @@ Skip and do nothing if any of these holds:
 
 - the session worked in the main branch (`main`, `master`, `dev`) — nothing to close;
 - the branch is a release or long-lived one (`dev`, `release/*`) — it is not a "task";
-- you did not create the branch and the human never asked about it.
+- you did not create the branch and the human never asked about it. A branch the app created for this session (Claude Code's `.claude/worktrees/<name>`, an Orca workspace) counts as yours: it is the session's own branch.
+
+Even when you skip the rest, step 3a still applies to this session's own journal if it sits in a branch other than main.
 
 ## Safety invariants
 
@@ -45,6 +47,8 @@ git merge --ff-only <branch>           # failed — stop, report to the human (i
 git push origin <main>                 # only if the repository has an origin
 ```
 
+Merging changes main, and so does step 3a: ask the human first, with one line in the final report («Branch `<branch>` is ready. Merge it into `<main>`? (yes)»), and wait for the yes. Auto mode blocks a merge in the primary copy and a push to main without an explicit yes in chat, so the usual failure here is not a rogue merge but a silent skip: the branch is never merged and its journal is lost to main.
+
 **3. Report if ff failed.** Do not fix it yourself. Three lines to the human: how many commits are on the branch, what they touch, four options (carry over via `cherry-pick` / rewrite manually in main / archive as a tag / discard). Then follow their decision; do not delete the branch until they answer.
 
 Before reporting, run `git cherry main <branch>`: a `-` marks a commit whose equivalent is already in main (typical after a squash-merged PR — the branch only looks unmerged), `+` marks one that is genuinely missing. All `-` — the branch is spent, no human decision needed.
@@ -56,6 +60,16 @@ git tag -a archive/<branch> <branch> -m "<what it was, why it was not merged, ho
 git push origin archive/<branch>          # if the repository has an origin
 # restore later: git checkout -b restore archive/<branch>
 ```
+
+**3a. The journal goes to main in any case.** Whatever happens to the branch (ff failed, the work is unfinished, the human has not decided yet), the session journal must not stay only in the branch: nobody merges such branches later, and the entry is lost to main, to the next sessions and to the memory index (24.09.2026: 11 such journals across two projects). Carry over the journal file(s) alone, as a separate commit on main, from the PRIMARY working copy, after the human's yes («Journal `<file>` is only in branch `<branch>`. Carry it to `<main>`? (yes)»):
+
+```bash
+git checkout <branch> -- <journal paths>                          # only the journal files
+git commit -m "Journal: <file> from <branch>" -- <journal paths>   # only these paths; other staged changes stay out
+git push origin <main>                                            # only if the repository has an origin
+```
+
+Projects on the `_client-template` standard (1.1+) ship `.agents/bin/journal-scan.sh`: run it instead. It lists every journal missing from main (all branches, `origin/*`, uncommitted ones in every worktree), and `journal-scan.sh --apply --push` does the carry-over above, skipping versions that diverged and files already edited in the primary copy.
 
 **4. Remove the worktree** (if the branch lived in a separate working copy):
 
